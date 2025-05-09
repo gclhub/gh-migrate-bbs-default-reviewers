@@ -418,7 +418,7 @@ func updateGitHubCodeowners(repo string, content string) error {
 	// Check if gh CLI is installed
 	fmt.Printf("📝 Checking GitHub CLI...\n")
 
-	// Create CODEOWNERS directory if it doesn't exist
+	// Create CODEOWNERS file using GitHub API
 	fmt.Printf("📝 Creating CODEOWNERS file...\n")
 
 	// First, create a temporary file with the content
@@ -434,28 +434,18 @@ func updateGitHubCodeowners(repo string, content string) error {
 	}
 	tempFile.Close()
 
-	// Use the gh CLI to create or update the CODEOWNERS file
-	// This is a simpler approach that avoids complex API calls
-	ghCmd := exec.Command("gh", "repo", "edit", repo, "--add-file", tempFile.Name(), "--codeowners")
+	// Use GitHub API to create or update the file
+	uploadCmd := exec.Command("gh", "api",
+		fmt.Sprintf("repos/%s/contents/.github/CODEOWNERS", repo),
+		"--method", "PUT",
+		"-f", fmt.Sprintf("message=Add CODEOWNERS from BitBucket Server default reviewers"),
+		"-f", fmt.Sprintf("content=%s", base64Content(content)))
+
 	var stderr bytes.Buffer
-	ghCmd.Stderr = &stderr
+	uploadCmd.Stderr = &stderr
 
-	if err := ghCmd.Run(); err != nil {
-		// If that fails, try alternative approach using standard file path
-		fmt.Printf("📝 Using alternative approach with content upload...\n")
-
-		// Create .github directory if it doesn't exist
-		// Use gh API to create the file directly
-		uploadCmd := exec.Command("gh", "api",
-			fmt.Sprintf("repos/%s/contents/.github/CODEOWNERS", repo),
-			"--method", "PUT",
-			"-f", fmt.Sprintf("message=Add CODEOWNERS from BitBucket Server default reviewers"),
-			"-f", fmt.Sprintf("content=%s", base64Content(content)))
-
-		uploadCmd.Stderr = &stderr
-		if err := uploadCmd.Run(); err != nil {
-			return fmt.Errorf("failed to create CODEOWNERS file: %w - %s", err, stderr.String())
-		}
+	if err := uploadCmd.Run(); err != nil {
+		return fmt.Errorf("failed to create CODEOWNERS file: %w - %s", err, stderr.String())
 	}
 
 	fmt.Printf("✅ CODEOWNERS file created successfully in %s\n", repo)
