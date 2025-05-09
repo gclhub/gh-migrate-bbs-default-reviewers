@@ -43,6 +43,10 @@ gh migrate-bbs-default-reviewers https://bitbucket.example.com PROJ repo-name ow
 1. Fetches default reviewers configuration from BitBucket Server using its REST API
 2. Converts the default reviewers into GitHub CODEOWNERS format
 3. Creates or updates the `.github/CODEOWNERS` file in the specified GitHub repository
+4. Creates a repository ruleset that enforces code owner approvals on pull requests
+   - Requires at least one approval from a code owner
+   - Applies to both main and master branches
+   - Repository admins can bypass these restrictions
 
 ## Requirements
 

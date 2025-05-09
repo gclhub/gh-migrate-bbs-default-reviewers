@@ -127,6 +127,11 @@ func run(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to update CODEOWNERS: %w", err)
 	}
 
+	// Create repository ruleset to enforce code owner approvals
+	if err := createCodeOwnersRuleset(githubRepo); err != nil {
+		return fmt.Errorf("failed to create repository ruleset: %w", err)
+	}
+
 	return nil
 }
 
@@ -455,6 +460,35 @@ func updateGitHubCodeowners(repo string, content string) error {
 // Helper function to base64 encode content for GitHub API
 func base64Content(content string) string {
 	return base64.StdEncoding.EncodeToString([]byte(content))
+}
+
+func createCodeOwnersRuleset(repo string) error {
+	fmt.Printf("📝 Creating repository ruleset to enforce code owner approvals...\n")
+
+	// Create ruleset using GitHub API
+	rulesetCmd := exec.Command("gh", "api",
+		fmt.Sprintf("repos/%s/rulesets", repo),
+		"--method", "POST",
+		"-H", "Accept: application/vnd.github+json",
+		"-f", "name=Code Owners Review Policy",
+		"-f", "target=branch",
+		"-f", "enforcement=active",
+		"-f", "rules[0][type]=required_reviewers",
+		"-f", "rules[0][parameters][required_approving_review_count]=1",
+		"-f", "rules[0][parameters][require_code_owner_review]=true",
+		"-f", "conditions[ref_name][include][patterns][]=refs/heads/main",
+		"-f", "conditions[ref_name][include][patterns][]=refs/heads/master",
+		"-f", "bypass_actors[]=repository_admin")
+
+	var stderr bytes.Buffer
+	rulesetCmd.Stderr = &stderr
+
+	if err := rulesetCmd.Run(); err != nil {
+		return fmt.Errorf("failed to create ruleset: %w - %s", err, stderr.String())
+	}
+
+	fmt.Printf("✅ Repository ruleset created successfully\n")
+	return nil
 }
 
 func extractReviewersFromMap(data map[string]interface{}, reviewers *[]BitbucketDefaultReviewer) {
