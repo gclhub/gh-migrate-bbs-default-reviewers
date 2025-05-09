@@ -15,15 +15,22 @@ gh extension install gclhub/gh-migrate-bbs-default-reviewers
 ## Usage
 
 ```bash
-gh migrate-bbs-default-reviewers [bitbucket-url] [bitbucket-project] [bitbucket-repo] [github-repo] --token [bitbucket-token]
+gh migrate-bbs-default-reviewers [bitbucket-clone-url] [github-repo] --token [bitbucket-token]
 ```
+
+### Prerequisites
+
+1. Create the destination GitHub repository first:
+   ```bash
+   gh repo create owner/repo-name
+   ```
 
 ### Arguments
 
-- `bitbucket-url`: The base URL of your BitBucket Server instance (e.g., https://bitbucket.example.com)
-- `bitbucket-project`: The BitBucket project key
-- `bitbucket-repo`: The BitBucket repository name
-- `github-repo`: The GitHub repository in `owner/repo` format
+- `bitbucket-clone-url`: The HTTPS clone URL of your BitBucket Server repository
+  - For project repositories: `https://bitbucket.example.com/scm/PROJECT/repository.git`
+  - For user repositories: `https://bitbucket.example.com/scm/~username/repository.git`
+- `github-repo`: The GitHub repository in `owner/repo` format (must exist)
 - `--token`: BitBucket Server personal access token with read permissions
 
 ### Flags
@@ -35,7 +42,11 @@ gh migrate-bbs-default-reviewers [bitbucket-url] [bitbucket-project] [bitbucket-
 ### Example
 
 ```bash
-gh migrate-bbs-default-reviewers https://bitbucket.example.com PROJ repo-name owner/migrated-repo --token mytoken123
+# Project repository
+gh migrate-bbs-default-reviewers https://bitbucket.example.com/scm/PROJ/repo-name.git owner/migrated-repo --token mytoken123
+
+# User repository
+gh migrate-bbs-default-reviewers https://bitbucket.example.com/scm/~username/repo-name.git owner/migrated-repo --token mytoken123
 ```
 
 ## What it does
@@ -53,6 +64,7 @@ gh migrate-bbs-default-reviewers https://bitbucket.example.com PROJ repo-name ow
 - GitHub CLI (`gh`) installed and authenticated
 - BitBucket Server personal access token with read permissions
 - Go 1.16 or later for development
+- Destination GitHub repository must exist before running this tool
 
 ## Building from source
 

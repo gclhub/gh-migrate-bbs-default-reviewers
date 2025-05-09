@@ -40,23 +40,29 @@ const retryDelay = 2 * time.Second
 
 func main() {
 	rootCmd := &cobra.Command{
-		Use:   "gh-migrate-bbs-default-reviewers [bitbucket-url] [bitbucket-project-or-user] [bitbucket-repo] [github-repo]",
+		Use:   "gh-migrate-bbs-default-reviewers [bitbucket-clone-url] [github-repo]",
 		Short: "Migrate BitBucket Server default reviewers to GitHub CODEOWNERS",
 		Long: `Migrate BitBucket Server default reviewers to GitHub CODEOWNERS file.
 		
 The tool fetches default reviewers from a BitBucket Server repository and creates or updates
 a CODEOWNERS file in the specified GitHub repository. It supports both Bearer token and Basic
-auth token formats.`,
+auth token formats.
+
+The BitBucket Server repository should be specified using its HTTPS clone URL, for example:
+- Project repository: https://bitbucket.example.com/scm/PROJECT/repository.git
+- User repository:    https://bitbucket.example.com/scm/~username/repository.git`,
 		Args: func(cmd *cobra.Command, args []string) error {
-			if err := cobra.ExactArgs(4)(cmd, args); err != nil {
+			if err := cobra.ExactArgs(2)(cmd, args); err != nil {
 				return err
 			}
-			// Validate BitBucket URL
-			if _, err := url.Parse(args[0]); err != nil {
-				return fmt.Errorf("invalid BitBucket Server URL: %w", err)
+			
+			// Validate BitBucket clone URL
+			if _, err := parseBitbucketCloneURL(args[0]); err != nil {
+				return err
 			}
+			
 			// Validate GitHub repo format
-			if !strings.Contains(args[3], "/") {
+			if !strings.Contains(args[1], "/") {
 				return fmt.Errorf("GitHub repository must be in format owner/repo")
 			}
 			return nil
@@ -92,17 +98,21 @@ func hasVersionFlag(args []string) bool {
 }
 
 func run(cmd *cobra.Command, args []string) error {
-	bbsURL := strings.TrimRight(args[0], "/")
-	bbsProjectOrUser := args[1]
-	bbsRepo := args[2]
-	githubRepo := args[3]
+	bbsCloneURL := args[0]
+	githubRepo := args[1]
 	token, _ := cmd.Flags().GetString("token")
 	useBasicAuth, _ := cmd.Flags().GetBool("basic-auth")
 
-	fmt.Printf("🔍 Fetching default reviewers from %s/%s...\n", bbsProjectOrUser, bbsRepo)
+	// Parse BitBucket clone URL
+	bbsRepo, err := parseBitbucketCloneURL(bbsCloneURL)
+	if err != nil {
+		return fmt.Errorf("failed to parse BitBucket clone URL: %w", err)
+	}
+
+	fmt.Printf("🔍 Fetching default reviewers from %s/%s...\n", bbsRepo.ProjectOrUser, bbsRepo.RepoName)
 
 	// Get default reviewers from BitBucket Server
-	reviewers, err := fetchBitbucketDefaultReviewers(bbsURL, bbsProjectOrUser, bbsRepo, token, useBasicAuth)
+	reviewers, err := fetchBitbucketDefaultReviewers(bbsRepo.BaseURL, bbsRepo.ProjectOrUser, bbsRepo.RepoName, token, useBasicAuth)
 	if err != nil {
 		return fmt.Errorf("failed to fetch default reviewers: %w", err)
 	}
@@ -121,6 +131,11 @@ func run(cmd *cobra.Command, args []string) error {
 
 	// Print preview of CODEOWNERS content
 	fmt.Printf("\nCODEOWNERS preview:\n%s\n", codeowners)
+
+	// Ensure GitHub repository exists
+	if err := checkGitHubRepository(githubRepo); err != nil {
+		return fmt.Errorf("failed to ensure GitHub repository: %w", err)
+	}
 
 	// Create or update CODEOWNERS file in GitHub
 	if err := updateGitHubCodeowners(githubRepo, codeowners); err != nil {
@@ -160,11 +175,11 @@ func fetchBitbucketDefaultReviewers(baseURL, projectOrUser, repo, token string, 
 		"Bearer " + token,
 	}
 
-	// Format the project key - personal repositories use ~username notation
+	// Use the project/user key exactly as it appears in the clone URL
+	// BitBucket Server clone URLs already have the correct format:
+	// - Project repos: /scm/PROJECT/repo.git
+	// - User repos: /scm/~username/repo.git
 	userOrProjectKey := projectOrUser
-	if !strings.HasPrefix(userOrProjectKey, "~") && strings.ToLower(userOrProjectKey) != "public" {
-		userOrProjectKey = "~" + userOrProjectKey
-	}
 
 	var lastError error
 
@@ -420,13 +435,25 @@ func generateCodeowners(reviewers []BitbucketDefaultReviewer) string {
 }
 
 func updateGitHubCodeowners(repo string, content string) error {
-	// Check if gh CLI is installed
 	fmt.Printf("📝 Checking GitHub CLI...\n")
 
-	// Create CODEOWNERS file using GitHub API
-	fmt.Printf("📝 Creating CODEOWNERS file...\n")
+	// First, check if the file already exists and get its SHA if it does
+	fmt.Printf("📝 Checking if CODEOWNERS file exists...\n")
+	
+	checkCmd := exec.Command("gh", "api",
+		fmt.Sprintf("repos/%s/contents/.github/CODEOWNERS", repo),
+		"-q", ".sha")
 
-	// First, create a temporary file with the content
+	var fileSHA string
+	checkOutput, err := checkCmd.Output()
+	if err == nil {
+		fileSHA = strings.TrimSpace(string(checkOutput))
+		fmt.Printf("📝 Updating existing CODEOWNERS file...\n")
+	} else {
+		fmt.Printf("📝 Creating new CODEOWNERS file...\n")
+	}
+
+	// Create a temporary file with the content
 	tempFile, err := os.CreateTemp("", "CODEOWNERS")
 	if err != nil {
 		return fmt.Errorf("failed to create temporary file: %w", err)
@@ -440,12 +467,20 @@ func updateGitHubCodeowners(repo string, content string) error {
 	tempFile.Close()
 
 	// Use GitHub API to create or update the file
-	uploadCmd := exec.Command("gh", "api",
+	args := []string{
+		"api",
 		fmt.Sprintf("repos/%s/contents/.github/CODEOWNERS", repo),
 		"--method", "PUT",
 		"-f", fmt.Sprintf("message=Add CODEOWNERS from BitBucket Server default reviewers"),
-		"-f", fmt.Sprintf("content=%s", base64Content(content)))
+		"-f", fmt.Sprintf("content=%s", base64Content(content)),
+	}
 
+	// Add SHA if we're updating an existing file
+	if fileSHA != "" {
+		args = append(args, "-f", fmt.Sprintf("sha=%s", fileSHA))
+	}
+
+	uploadCmd := exec.Command("gh", args...)
 	var stderr bytes.Buffer
 	uploadCmd.Stderr = &stderr
 
@@ -453,7 +488,9 @@ func updateGitHubCodeowners(repo string, content string) error {
 		return fmt.Errorf("failed to create CODEOWNERS file: %w - %s", err, stderr.String())
 	}
 
-	fmt.Printf("✅ CODEOWNERS file created successfully in %s\n", repo)
+	fmt.Printf("✅ CODEOWNERS file %s successfully in %s\n", 
+		map[bool]string{true: "updated", false: "created"}[fileSHA != ""],
+		repo)
 	return nil
 }
 
@@ -463,31 +500,111 @@ func base64Content(content string) string {
 }
 
 func createCodeOwnersRuleset(repo string) error {
-	fmt.Printf("📝 Creating repository ruleset to enforce code owner approvals...\n")
+    fmt.Printf("📝 Checking if repository rulesets are available...\n")
 
-	// Create ruleset using GitHub API
-	rulesetCmd := exec.Command("gh", "api",
-		fmt.Sprintf("repos/%s/rulesets", repo),
-		"--method", "POST",
-		"-H", "Accept: application/vnd.github+json",
-		"-f", "name=Code Owners Review Policy",
-		"-f", "target=branch",
-		"-f", "enforcement=active",
-		"-f", "rules[0][type]=required_reviewers",
-		"-f", "rules[0][parameters][required_approving_review_count]=1",
-		"-f", "rules[0][parameters][require_code_owner_review]=true",
-		"-f", "conditions[ref_name][include][patterns][]=refs/heads/main",
-		"-f", "conditions[ref_name][include][patterns][]=refs/heads/master",
-		"-f", "bypass_actors[]=repository_admin")
+    // Check repository type and visibility
+    repoInfoCmd := exec.Command("gh", "api",
+        fmt.Sprintf("repos/%s", repo),
+        "-q", "[.visibility, .owner.type]")
+    
+    output, err := repoInfoCmd.Output()
+    if err != nil {
+        return fmt.Errorf("failed to get repository information: %w", err)
+    }
 
-	var stderr bytes.Buffer
-	rulesetCmd.Stderr = &stderr
+    var repoInfo []string
+    if err := json.Unmarshal(output, &repoInfo); err != nil {
+        return fmt.Errorf("failed to parse repository information: %w", err)
+    }
 
-	if err := rulesetCmd.Run(); err != nil {
-		return fmt.Errorf("failed to create ruleset: %w - %s", err, stderr.String())
+    visibility := repoInfo[0]
+    ownerType := repoInfo[1]
+
+    // Personal repositories need to be public or on a pro plan
+    if ownerType == "User" && visibility != "public" {
+        fmt.Printf("⚠️  Repository rulesets are only available for public repositories or repositories on GitHub Pro plans.\n")
+        fmt.Printf("ℹ️  You can still use the CODEOWNERS file, but you'll need to configure branch protection rules manually.\n")
+        fmt.Printf("ℹ️  To enable rulesets, either:\n")
+        fmt.Printf("   1. Make the repository public, or\n")
+        fmt.Printf("   2. Upgrade to GitHub Pro\n")
+        return nil
+    }
+
+    fmt.Printf("📝 Creating repository ruleset to enforce code owner approvals...\n")
+
+    // Create the ruleset request using the documented GitHub API format
+    ruleset := map[string]interface{}{
+        "name": "Code Owners Review Policy",
+        "target": "branch",
+        "enforcement": "active",
+        "conditions": map[string]interface{}{
+            "ref_name": map[string]interface{}{
+                "include": []string{"refs/heads/main", "refs/heads/master"},
+                "exclude": []string{},
+            },
+        },
+        "rules": []map[string]interface{}{
+            {
+                "type": "pull_request",
+                "parameters": map[string]interface{}{
+                    // Using documented parameter names from the GitHub API
+                    "dismiss_stale_reviews_on_push": true,
+                    "require_code_owner_review": true,
+                    "required_review_thread_resolution": true,
+                    "required_approving_review_count": 1,
+                    "require_last_push_approval": true,
+                },
+            },
+        },
+    }
+
+    // Convert to JSON
+    jsonData, err := json.Marshal(ruleset)
+    if err != nil {
+        return fmt.Errorf("failed to create JSON request: %w", err)
+    }
+
+    // Create ruleset using GitHub API with proper headers and response handling
+    rulesetCmd := exec.Command("gh", "api",
+        fmt.Sprintf("repos/%s/rulesets", repo),
+        "--method", "POST",
+        "-H", "Accept: application/vnd.github+json",
+        "-H", "Content-Type: application/json",
+        "--input", "-")
+
+    // Set up input/output pipes
+    rulesetCmd.Stdin = bytes.NewReader(jsonData)
+    var stderr bytes.Buffer
+    rulesetCmd.Stderr = &stderr
+
+    if err := rulesetCmd.Run(); err != nil {
+        // Check if this is a 404 (repository not found) or 422 (validation error)
+        if strings.Contains(stderr.String(), "HTTP 404") {
+            return fmt.Errorf("repository not found: %s", repo)
+        }
+        if strings.Contains(stderr.String(), "HTTP 422") {
+            return fmt.Errorf("invalid ruleset format or repository does not support rulesets: %s", stderr.String())
+        }
+        return fmt.Errorf("failed to create ruleset: %w - %s", err, stderr.String())
+    }
+
+    fmt.Printf("✅ Repository ruleset created successfully\n")
+    return nil
+}
+
+func checkGitHubRepository(repo string) error {
+	fmt.Printf("📝 Checking if GitHub repository %s exists...\n", repo)
+
+	// Try to get repository info
+	checkCmd := exec.Command("gh", "api",
+		fmt.Sprintf("repos/%s", repo),
+		"--silent")
+
+	if err := checkCmd.Run(); err != nil {
+		return fmt.Errorf("GitHub repository %s does not exist. Please create it first using:\n\ngh repo create %s\n", repo, repo)
 	}
 
-	fmt.Printf("✅ Repository ruleset created successfully\n")
+	fmt.Printf("✅ Repository exists\n")
 	return nil
 }
 
@@ -517,4 +634,44 @@ func extractReviewersFromMap(data map[string]interface{}, reviewers *[]Bitbucket
 			extractReviewersFromMap(nestedMap, reviewers)
 		}
 	}
+}
+
+// BitbucketRepo holds information parsed from a BitBucket Server clone URL
+type BitbucketRepo struct {
+	BaseURL     string // e.g., https://bitbucket.example.com
+	ProjectOrUser string // e.g., PROJECT or ~username
+	RepoName    string // The repository name
+}
+
+// parseBitbucketCloneURL parses a BitBucket Server clone URL into its components
+func parseBitbucketCloneURL(cloneURL string) (*BitbucketRepo, error) {
+	u, err := url.Parse(cloneURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid URL: %w", err)
+	}
+
+	// Remove .git suffix if present
+	path := strings.TrimSuffix(u.Path, ".git")
+	
+	// Split path components
+	parts := strings.Split(strings.TrimPrefix(path, "/"), "/")
+	
+	// BitBucket Server clone URLs should have format:
+	// /scm/PROJECT/repo.git or /scm/~username/repo.git
+	if len(parts) < 3 || parts[0] != "scm" {
+		return nil, fmt.Errorf("not a valid BitBucket Server clone URL: %s", cloneURL)
+	}
+
+	// Extract project/user and repo name
+	projectOrUser := parts[1]
+	repoName := parts[2]
+
+	// Get base URL by removing path and query
+	baseURL := fmt.Sprintf("%s://%s", u.Scheme, u.Host)
+
+	return &BitbucketRepo{
+		BaseURL:      baseURL,
+		ProjectOrUser: projectOrUser, // Keep the project key or username as-is from the clone URL
+		RepoName:     repoName,
+	}, nil
 }
