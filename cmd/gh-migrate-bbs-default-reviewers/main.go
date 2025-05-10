@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -38,6 +39,16 @@ type BitbucketDefaultReviewersResponse struct {
 const maxRetries = 3
 const retryDelay = 2 * time.Second
 
+// GHESVersion holds GitHub Enterprise Server version information
+type GHESVersion struct {
+	SupportsRulesets bool
+	Version          string
+}
+
+var (
+	ghesVersionCache *GHESVersion
+)
+
 func main() {
 	rootCmd := &cobra.Command{
 		Use:   "gh-migrate-bbs-default-reviewers [bitbucket-clone-url] [github-repo]",
@@ -50,7 +61,9 @@ auth token formats.
 
 The BitBucket Server repository should be specified using its HTTPS clone URL, for example:
 - Project repository: https://bitbucket.example.com/scm/PROJECT/repository.git
-- User repository:    https://bitbucket.example.com/scm/~username/repository.git`,
+- User repository:    https://bitbucket.example.com/scm/~username/repository.git
+
+For GitHub Enterprise Server, use the --github-host flag to specify your instance hostname.`,
 		Args: func(cmd *cobra.Command, args []string) error {
 			if err := cobra.ExactArgs(2)(cmd, args); err != nil {
 				return err
@@ -65,6 +78,13 @@ The BitBucket Server repository should be specified using its HTTPS clone URL, f
 			if !strings.Contains(args[1], "/") {
 				return fmt.Errorf("GitHub repository must be in format owner/repo")
 			}
+
+			// If github-host is specified, validate it
+			if host, _ := cmd.Flags().GetString("github-host"); host != "" {
+				if strings.HasPrefix(host, "http://") || strings.HasPrefix(host, "https://") {
+					return fmt.Errorf("github-host should be just the hostname without protocol (e.g., github.mycompany.com)")
+				}
+			}
 			return nil
 		},
 		RunE: run,
@@ -73,6 +93,7 @@ The BitBucket Server repository should be specified using its HTTPS clone URL, f
 	rootCmd.Flags().StringP("token", "t", "", "BitBucket Server personal access token or basic auth token")
 	rootCmd.MarkFlagRequired("token")
 	rootCmd.Flags().BoolP("basic-auth", "b", false, "Use HTTP Basic Authentication instead of Bearer token")
+	rootCmd.Flags().StringP("github-host", "g", "", "GitHub Enterprise Server hostname (e.g., github.mycompany.com)")
 	rootCmd.Flags().BoolP("version", "v", false, "Show version information")
 
 	// Version flag handler
@@ -97,11 +118,77 @@ func hasVersionFlag(args []string) bool {
 	return false
 }
 
+// detectGHESVersion detects if we're running against GHES and what version
+func detectGHESVersion() (*GHESVersion, error) {
+	if ghesVersionCache != nil {
+		return ghesVersionCache, nil
+	}
+
+	// Try to get version from meta API
+	cmd := exec.Command("gh", "api", "meta")
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get GitHub meta info: %w", err)
+	}
+
+	var meta struct {
+		InstalledVersion string `json:"installed_version"`
+	}
+
+	if err := json.Unmarshal(output, &meta); err != nil {
+		return nil, fmt.Errorf("failed to parse meta response: %w", err)
+	}
+
+	version := &GHESVersion{
+		Version: meta.InstalledVersion,
+	}
+
+	// GHES 3.8 and later support repository rulesets
+	// https://docs.github.com/en/enterprise-server@3.8/rest/repos/rules
+	if meta.InstalledVersion != "" {
+		parts := strings.Split(meta.InstalledVersion, ".")
+		if len(parts) >= 2 {
+			major, _ := strconv.Atoi(parts[0])
+			minor, _ := strconv.Atoi(parts[1])
+			version.SupportsRulesets = major > 3 || (major == 3 && minor >= 8)
+		}
+	} else {
+		// If no version is returned, assume we're on github.com which supports rulesets
+		version.SupportsRulesets = true
+	}
+
+	ghesVersionCache = version
+	return version, nil
+}
+
+// getGitHubAPICommand returns a GitHub CLI command with the proper host and API version configuration
+func getGitHubAPICommand(args ...string) *exec.Cmd {
+	cmd := exec.Command("gh", args...)
+	
+	// If GITHUB_HOST environment variable is set, it will be used automatically by gh CLI
+	// Otherwise, we need to check if --github-host flag was provided
+	if os.Getenv("GITHUB_HOST") == "" {
+		if flagSet := cmd.Args[0]; flagSet != "" {
+			if host, err := cobra.NewCommand().Flags().GetString("github-host"); err == nil && host != "" {
+				cmd.Env = append(os.Environ(), fmt.Sprintf("GITHUB_HOST=%s", host))
+			}
+		}
+	}
+	
+	return cmd
+}
+
 func run(cmd *cobra.Command, args []string) error {
 	bbsCloneURL := args[0]
 	githubRepo := args[1]
 	token, _ := cmd.Flags().GetString("token")
 	useBasicAuth, _ := cmd.Flags().GetBool("basic-auth")
+	githubHost, _ := cmd.Flags().GetString("github-host")
+
+	// If github-host is provided, set it as an environment variable
+	if githubHost != "" {
+		os.Setenv("GITHUB_HOST", githubHost)
+	}
 
 	// Parse BitBucket clone URL
 	bbsRepo, err := parseBitbucketCloneURL(bbsCloneURL)
@@ -440,7 +527,7 @@ func updateGitHubCodeowners(repo string, content string) error {
 	// First, check if the file already exists and get its SHA if it does
 	fmt.Printf("📝 Checking if CODEOWNERS file exists...\n")
 	
-	checkCmd := exec.Command("gh", "api",
+	checkCmd := getGitHubAPICommand("api",
 		fmt.Sprintf("repos/%s/contents/.github/CODEOWNERS", repo),
 		"-q", ".sha")
 
@@ -480,7 +567,7 @@ func updateGitHubCodeowners(repo string, content string) error {
 		args = append(args, "-f", fmt.Sprintf("sha=%s", fileSHA))
 	}
 
-	uploadCmd := exec.Command("gh", args...)
+	uploadCmd := getGitHubAPICommand(args...)
 	var stderr bytes.Buffer
 	uploadCmd.Stderr = &stderr
 
@@ -499,11 +586,27 @@ func base64Content(content string) string {
 	return base64.StdEncoding.EncodeToString([]byte(content))
 }
 
+// createCodeOwnersRuleset creates a ruleset or falls back to branch protection rules based on GHES version
 func createCodeOwnersRuleset(repo string) error {
+    fmt.Printf("📝 Checking GitHub Enterprise Server version and features...\n")
+
+    version, err := detectGHESVersion()
+    if err != nil {
+        fmt.Printf("⚠️  Could not detect GitHub version: %v\n", err)
+        fmt.Printf("ℹ️  Will attempt to create ruleset anyway...\n")
+    } else if version.Version != "" {
+        fmt.Printf("📝 Detected GitHub Enterprise Server version %s\n", version.Version)
+        if !version.SupportsRulesets {
+            fmt.Printf("⚠️  This version of GitHub Enterprise Server does not support repository rulesets.\n")
+            fmt.Printf("ℹ️  Creating branch protection rule instead...\n")
+            return createBranchProtectionRule(repo)
+        }
+    }
+
     fmt.Printf("📝 Checking if repository rulesets are available...\n")
 
     // Check repository type and visibility
-    repoInfoCmd := exec.Command("gh", "api",
+    repoInfoCmd := getGitHubAPICommand("api",
         fmt.Sprintf("repos/%s", repo),
         "-q", "[.visibility, .owner.type]")
     
@@ -547,7 +650,6 @@ func createCodeOwnersRuleset(repo string) error {
             {
                 "type": "pull_request",
                 "parameters": map[string]interface{}{
-                    // Using documented parameter names from the GitHub API
                     "dismiss_stale_reviews_on_push": true,
                     "require_code_owner_review": true,
                     "required_review_thread_resolution": true,
@@ -564,8 +666,8 @@ func createCodeOwnersRuleset(repo string) error {
         return fmt.Errorf("failed to create JSON request: %w", err)
     }
 
-    // Create ruleset using GitHub API with proper headers and response handling
-    rulesetCmd := exec.Command("gh", "api",
+    // Create ruleset using GitHub API
+    rulesetCmd := getGitHubAPICommand("api",
         fmt.Sprintf("repos/%s/rulesets", repo),
         "--method", "POST",
         "-H", "Accept: application/vnd.github+json",
@@ -592,15 +694,62 @@ func createCodeOwnersRuleset(repo string) error {
     return nil
 }
 
+// createBranchProtectionRule creates a branch protection rule for CODEOWNERS enforcement
+func createBranchProtectionRule(repo string) error {
+    fmt.Printf("📝 Creating branch protection rules for main and master branches...\n")
+
+    // Create branch protection rules for both main and master
+    for _, branch := range []string{"main", "master"} {
+        // Check if branch exists first
+        branchCmd := getGitHubAPICommand("api",
+            fmt.Sprintf("repos/%s/branches/%s", repo, branch),
+            "--silent")
+        
+        if branchCmd.Run() != nil {
+            fmt.Printf("ℹ️  Branch %s does not exist, skipping protection rule\n", branch)
+            continue
+        }
+
+        // Create branch protection rule
+        protectionCmd := getGitHubAPICommand("api",
+            fmt.Sprintf("repos/%s/branches/%s/protection", repo, branch),
+            "--method", "PUT",
+            "-H", "Accept: application/vnd.github+json",
+            "-f", "required_status_checks=null",
+            "-f", "enforce_admins=false",
+            "-f", "required_pull_request_reviews[dismiss_stale_reviews]=true",
+            "-f", "required_pull_request_reviews[require_code_owner_reviews]=true",
+            "-f", "required_pull_request_reviews[required_approving_review_count]=1",
+            "-f", "restrictions=null")
+
+        var stderr bytes.Buffer
+        protectionCmd.Stderr = &stderr
+        
+        if err := protectionCmd.Run(); err != nil {
+            // Special handling for private repos without necessary plan
+            if strings.Contains(stderr.String(), "422") && 
+               strings.Contains(stderr.String(), "Repository must have premium protection") {
+                fmt.Printf("⚠️  Unable to create branch protection rule for %s:\n", branch)
+                fmt.Printf("   Repository requires GitHub Pro/Enterprise to enable branch protection.\n")
+                continue
+            }
+            return fmt.Errorf("failed to create branch protection for %s: %w - %s", branch, err, stderr.String())
+        }
+
+        fmt.Printf("✅ Created branch protection rule for %s\n", branch)
+    }
+
+    return nil
+}
+
 func checkGitHubRepository(repo string) error {
 	fmt.Printf("📝 Checking if GitHub repository %s exists...\n", repo)
 
-	// Try to get repository info
-	checkCmd := exec.Command("gh", "api",
+	cmd := getGitHubAPICommand("api",
 		fmt.Sprintf("repos/%s", repo),
 		"--silent")
 
-	if err := checkCmd.Run(); err != nil {
+	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("GitHub repository %s does not exist. Please create it first using:\n\ngh repo create %s\n", repo, repo)
 	}
 
