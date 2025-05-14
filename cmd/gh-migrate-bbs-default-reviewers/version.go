@@ -3,10 +3,10 @@ package main
 // Version information for the GitHub CLI extension
 var (
 	// Version is the current version of the extension
-	Version = "1.0.0"
+	Version = "1.0.1"
 
 	// BuildDate is the date when the binary was built
-	BuildDate = "2025-04-14"
+	BuildDate = "2025-05-14"
 
 	// CommitSHA is the git commit SHA at build time
 	CommitSHA = "development"
