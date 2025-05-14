@@ -36,9 +36,6 @@ type BitbucketDefaultReviewersResponse struct {
 	NextPageStart int                        `json:"nextPageStart"`
 }
 
-const maxRetries = 3
-const retryDelay = 2 * time.Second
-
 // GHESVersion holds GitHub Enterprise Server version information
 type GHESVersion struct {
 	SupportsRulesets bool
@@ -68,12 +65,12 @@ For GitHub Enterprise Server, use the --github-host flag to specify your instanc
 			if err := cobra.ExactArgs(2)(cmd, args); err != nil {
 				return err
 			}
-			
+
 			// Validate BitBucket clone URL
 			if _, err := parseBitbucketCloneURL(args[0]); err != nil {
 				return err
 			}
-			
+
 			// Validate GitHub repo format
 			if !strings.Contains(args[1], "/") {
 				return fmt.Errorf("GitHub repository must be in format owner/repo")
@@ -164,17 +161,13 @@ func detectGHESVersion() (*GHESVersion, error) {
 // getGitHubAPICommand returns a GitHub CLI command with the proper host and API version configuration
 func getGitHubAPICommand(args ...string) *exec.Cmd {
 	cmd := exec.Command("gh", args...)
-	
+
 	// If GITHUB_HOST environment variable is set, it will be used automatically by gh CLI
-	// Otherwise, we need to check if --github-host flag was provided
-	if os.Getenv("GITHUB_HOST") == "" {
-		if flagSet := cmd.Args[0]; flagSet != "" {
-			if host, err := cobra.NewCommand().Flags().GetString("github-host"); err == nil && host != "" {
-				cmd.Env = append(os.Environ(), fmt.Sprintf("GITHUB_HOST=%s", host))
-			}
-		}
+	// Otherwise, we'll use the value already set in the environment
+	if host := os.Getenv("GITHUB_HOST"); host != "" {
+		cmd.Env = append(os.Environ(), "GITHUB_HOST="+host)
 	}
-	
+
 	return cmd
 }
 
@@ -526,7 +519,7 @@ func updateGitHubCodeowners(repo string, content string) error {
 
 	// First, check if the file already exists and get its SHA if it does
 	fmt.Printf("📝 Checking if CODEOWNERS file exists...\n")
-	
+
 	checkCmd := getGitHubAPICommand("api",
 		fmt.Sprintf("repos/%s/contents/.github/CODEOWNERS", repo),
 		"-q", ".sha")
@@ -558,7 +551,7 @@ func updateGitHubCodeowners(repo string, content string) error {
 		"api",
 		fmt.Sprintf("repos/%s/contents/.github/CODEOWNERS", repo),
 		"--method", "PUT",
-		"-f", fmt.Sprintf("message=Add CODEOWNERS from BitBucket Server default reviewers"),
+		"-f", "message=Add CODEOWNERS from BitBucket Server default reviewers",
 		"-f", fmt.Sprintf("content=%s", base64Content(content)),
 	}
 
@@ -575,7 +568,7 @@ func updateGitHubCodeowners(repo string, content string) error {
 		return fmt.Errorf("failed to create CODEOWNERS file: %w - %s", err, stderr.String())
 	}
 
-	fmt.Printf("✅ CODEOWNERS file %s successfully in %s\n", 
+	fmt.Printf("✅ CODEOWNERS file %s successfully in %s\n",
 		map[bool]string{true: "updated", false: "created"}[fileSHA != ""],
 		repo)
 	return nil
@@ -588,158 +581,158 @@ func base64Content(content string) string {
 
 // createCodeOwnersRuleset creates a ruleset or falls back to branch protection rules based on GHES version
 func createCodeOwnersRuleset(repo string) error {
-    fmt.Printf("📝 Checking GitHub Enterprise Server version and features...\n")
+	fmt.Printf("📝 Checking GitHub Enterprise Server version and features...\n")
 
-    version, err := detectGHESVersion()
-    if err != nil {
-        fmt.Printf("⚠️  Could not detect GitHub version: %v\n", err)
-        fmt.Printf("ℹ️  Will attempt to create ruleset anyway...\n")
-    } else if version.Version != "" {
-        fmt.Printf("📝 Detected GitHub Enterprise Server version %s\n", version.Version)
-        if !version.SupportsRulesets {
-            fmt.Printf("⚠️  This version of GitHub Enterprise Server does not support repository rulesets.\n")
-            fmt.Printf("ℹ️  Creating branch protection rule instead...\n")
-            return createBranchProtectionRule(repo)
-        }
-    }
+	version, err := detectGHESVersion()
+	if err != nil {
+		fmt.Printf("⚠️  Could not detect GitHub version: %v\n", err)
+		fmt.Printf("ℹ️  Will attempt to create ruleset anyway...\n")
+	} else if version.Version != "" {
+		fmt.Printf("📝 Detected GitHub Enterprise Server version %s\n", version.Version)
+		if !version.SupportsRulesets {
+			fmt.Printf("⚠️  This version of GitHub Enterprise Server does not support repository rulesets.\n")
+			fmt.Printf("ℹ️  Creating branch protection rule instead...\n")
+			return createBranchProtectionRule(repo)
+		}
+	}
 
-    fmt.Printf("📝 Checking if repository rulesets are available...\n")
+	fmt.Printf("📝 Checking if repository rulesets are available...\n")
 
-    // Check repository type and visibility
-    repoInfoCmd := getGitHubAPICommand("api",
-        fmt.Sprintf("repos/%s", repo),
-        "-q", "[.visibility, .owner.type]")
-    
-    output, err := repoInfoCmd.Output()
-    if err != nil {
-        return fmt.Errorf("failed to get repository information: %w", err)
-    }
+	// Check repository type and visibility
+	repoInfoCmd := getGitHubAPICommand("api",
+		fmt.Sprintf("repos/%s", repo),
+		"-q", "[.visibility, .owner.type]")
 
-    var repoInfo []string
-    if err := json.Unmarshal(output, &repoInfo); err != nil {
-        return fmt.Errorf("failed to parse repository information: %w", err)
-    }
+	output, err := repoInfoCmd.Output()
+	if err != nil {
+		return fmt.Errorf("failed to get repository information: %w", err)
+	}
 
-    visibility := repoInfo[0]
-    ownerType := repoInfo[1]
+	var repoInfo []string
+	if err := json.Unmarshal(output, &repoInfo); err != nil {
+		return fmt.Errorf("failed to parse repository information: %w", err)
+	}
 
-    // Personal repositories need to be public or on a pro plan
-    if ownerType == "User" && visibility != "public" {
-        fmt.Printf("⚠️  Repository rulesets are only available for public repositories or repositories on GitHub Pro plans.\n")
-        fmt.Printf("ℹ️  You can still use the CODEOWNERS file, but you'll need to configure branch protection rules manually.\n")
-        fmt.Printf("ℹ️  To enable rulesets, either:\n")
-        fmt.Printf("   1. Make the repository public, or\n")
-        fmt.Printf("   2. Upgrade to GitHub Pro\n")
-        return nil
-    }
+	visibility := repoInfo[0]
+	ownerType := repoInfo[1]
 
-    fmt.Printf("📝 Creating repository ruleset to enforce code owner approvals...\n")
+	// Personal repositories need to be public or on a pro plan
+	if ownerType == "User" && visibility != "public" {
+		fmt.Printf("⚠️  Repository rulesets are only available for public repositories or repositories on GitHub Pro plans.\n")
+		fmt.Printf("ℹ️  You can still use the CODEOWNERS file, but you'll need to configure branch protection rules manually.\n")
+		fmt.Printf("ℹ️  To enable rulesets, either:\n")
+		fmt.Printf("   1. Make the repository public, or\n")
+		fmt.Printf("   2. Upgrade to GitHub Pro\n")
+		return nil
+	}
 
-    // Create the ruleset request using the documented GitHub API format
-    ruleset := map[string]interface{}{
-        "name": "Code Owners Review Policy",
-        "target": "branch",
-        "enforcement": "active",
-        "conditions": map[string]interface{}{
-            "ref_name": map[string]interface{}{
-                "include": []string{"refs/heads/main", "refs/heads/master"},
-                "exclude": []string{},
-            },
-        },
-        "rules": []map[string]interface{}{
-            {
-                "type": "pull_request",
-                "parameters": map[string]interface{}{
-                    "dismiss_stale_reviews_on_push": true,
-                    "require_code_owner_review": true,
-                    "required_review_thread_resolution": true,
-                    "required_approving_review_count": 1,
-                    "require_last_push_approval": true,
-                },
-            },
-        },
-    }
+	fmt.Printf("📝 Creating repository ruleset to enforce code owner approvals...\n")
 
-    // Convert to JSON
-    jsonData, err := json.Marshal(ruleset)
-    if err != nil {
-        return fmt.Errorf("failed to create JSON request: %w", err)
-    }
+	// Create the ruleset request using the documented GitHub API format
+	ruleset := map[string]interface{}{
+		"name":        "Code Owners Review Policy",
+		"target":      "branch",
+		"enforcement": "active",
+		"conditions": map[string]interface{}{
+			"ref_name": map[string]interface{}{
+				"include": []string{"refs/heads/main", "refs/heads/master"},
+				"exclude": []string{},
+			},
+		},
+		"rules": []map[string]interface{}{
+			{
+				"type": "pull_request",
+				"parameters": map[string]interface{}{
+					"dismiss_stale_reviews_on_push":     true,
+					"require_code_owner_review":         true,
+					"required_review_thread_resolution": true,
+					"required_approving_review_count":   1,
+					"require_last_push_approval":        true,
+				},
+			},
+		},
+	}
 
-    // Create ruleset using GitHub API
-    rulesetCmd := getGitHubAPICommand("api",
-        fmt.Sprintf("repos/%s/rulesets", repo),
-        "--method", "POST",
-        "-H", "Accept: application/vnd.github+json",
-        "-H", "Content-Type: application/json",
-        "--input", "-")
+	// Convert to JSON
+	jsonData, err := json.Marshal(ruleset)
+	if err != nil {
+		return fmt.Errorf("failed to create JSON request: %w", err)
+	}
 
-    // Set up input/output pipes
-    rulesetCmd.Stdin = bytes.NewReader(jsonData)
-    var stderr bytes.Buffer
-    rulesetCmd.Stderr = &stderr
+	// Create ruleset using GitHub API
+	rulesetCmd := getGitHubAPICommand("api",
+		fmt.Sprintf("repos/%s/rulesets", repo),
+		"--method", "POST",
+		"-H", "Accept: application/vnd.github+json",
+		"-H", "Content-Type: application/json",
+		"--input", "-")
 
-    if err := rulesetCmd.Run(); err != nil {
-        // Check if this is a 404 (repository not found) or 422 (validation error)
-        if strings.Contains(stderr.String(), "HTTP 404") {
-            return fmt.Errorf("repository not found: %s", repo)
-        }
-        if strings.Contains(stderr.String(), "HTTP 422") {
-            return fmt.Errorf("invalid ruleset format or repository does not support rulesets: %s", stderr.String())
-        }
-        return fmt.Errorf("failed to create ruleset: %w - %s", err, stderr.String())
-    }
+	// Set up input/output pipes
+	rulesetCmd.Stdin = bytes.NewReader(jsonData)
+	var stderr bytes.Buffer
+	rulesetCmd.Stderr = &stderr
 
-    fmt.Printf("✅ Repository ruleset created successfully\n")
-    return nil
+	if err := rulesetCmd.Run(); err != nil {
+		// Check if this is a 404 (repository not found) or 422 (validation error)
+		if strings.Contains(stderr.String(), "HTTP 404") {
+			return fmt.Errorf("repository not found: %s", repo)
+		}
+		if strings.Contains(stderr.String(), "HTTP 422") {
+			return fmt.Errorf("invalid ruleset format or repository does not support rulesets: %s", stderr.String())
+		}
+		return fmt.Errorf("failed to create ruleset: %w - %s", err, stderr.String())
+	}
+
+	fmt.Printf("✅ Repository ruleset created successfully\n")
+	return nil
 }
 
 // createBranchProtectionRule creates a branch protection rule for CODEOWNERS enforcement
 func createBranchProtectionRule(repo string) error {
-    fmt.Printf("📝 Creating branch protection rules for main and master branches...\n")
+	fmt.Printf("📝 Creating branch protection rules for main and master branches...\n")
 
-    // Create branch protection rules for both main and master
-    for _, branch := range []string{"main", "master"} {
-        // Check if branch exists first
-        branchCmd := getGitHubAPICommand("api",
-            fmt.Sprintf("repos/%s/branches/%s", repo, branch),
-            "--silent")
-        
-        if branchCmd.Run() != nil {
-            fmt.Printf("ℹ️  Branch %s does not exist, skipping protection rule\n", branch)
-            continue
-        }
+	// Create branch protection rules for both main and master
+	for _, branch := range []string{"main", "master"} {
+		// Check if branch exists first
+		branchCmd := getGitHubAPICommand("api",
+			fmt.Sprintf("repos/%s/branches/%s", repo, branch),
+			"--silent")
 
-        // Create branch protection rule
-        protectionCmd := getGitHubAPICommand("api",
-            fmt.Sprintf("repos/%s/branches/%s/protection", repo, branch),
-            "--method", "PUT",
-            "-H", "Accept: application/vnd.github+json",
-            "-f", "required_status_checks=null",
-            "-f", "enforce_admins=false",
-            "-f", "required_pull_request_reviews[dismiss_stale_reviews]=true",
-            "-f", "required_pull_request_reviews[require_code_owner_reviews]=true",
-            "-f", "required_pull_request_reviews[required_approving_review_count]=1",
-            "-f", "restrictions=null")
+		if branchCmd.Run() != nil {
+			fmt.Printf("ℹ️  Branch %s does not exist, skipping protection rule\n", branch)
+			continue
+		}
 
-        var stderr bytes.Buffer
-        protectionCmd.Stderr = &stderr
-        
-        if err := protectionCmd.Run(); err != nil {
-            // Special handling for private repos without necessary plan
-            if strings.Contains(stderr.String(), "422") && 
-               strings.Contains(stderr.String(), "Repository must have premium protection") {
-                fmt.Printf("⚠️  Unable to create branch protection rule for %s:\n", branch)
-                fmt.Printf("   Repository requires GitHub Pro/Enterprise to enable branch protection.\n")
-                continue
-            }
-            return fmt.Errorf("failed to create branch protection for %s: %w - %s", branch, err, stderr.String())
-        }
+		// Create branch protection rule
+		protectionCmd := getGitHubAPICommand("api",
+			fmt.Sprintf("repos/%s/branches/%s/protection", repo, branch),
+			"--method", "PUT",
+			"-H", "Accept: application/vnd.github+json",
+			"-f", "required_status_checks=null",
+			"-f", "enforce_admins=false",
+			"-f", "required_pull_request_reviews[dismiss_stale_reviews]=true",
+			"-f", "required_pull_request_reviews[require_code_owner_reviews]=true",
+			"-f", "required_pull_request_reviews[required_approving_review_count]=1",
+			"-f", "restrictions=null")
 
-        fmt.Printf("✅ Created branch protection rule for %s\n", branch)
-    }
+		var stderr bytes.Buffer
+		protectionCmd.Stderr = &stderr
 
-    return nil
+		if err := protectionCmd.Run(); err != nil {
+			// Special handling for private repos without necessary plan
+			if strings.Contains(stderr.String(), "422") &&
+				strings.Contains(stderr.String(), "Repository must have premium protection") {
+				fmt.Printf("⚠️  Unable to create branch protection rule for %s:\n", branch)
+				fmt.Printf("   Repository requires GitHub Pro/Enterprise to enable branch protection.\n")
+				continue
+			}
+			return fmt.Errorf("failed to create branch protection for %s: %w - %s", branch, err, stderr.String())
+		}
+
+		fmt.Printf("✅ Created branch protection rule for %s\n", branch)
+	}
+
+	return nil
 }
 
 func checkGitHubRepository(repo string) error {
@@ -750,46 +743,18 @@ func checkGitHubRepository(repo string) error {
 		"--silent")
 
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("GitHub repository %s does not exist. Please create it first using:\n\ngh repo create %s\n", repo, repo)
+		return fmt.Errorf("GitHub repository %s does not exist. Please create it first using: gh repo create %s", repo, repo)
 	}
 
 	fmt.Printf("✅ Repository exists\n")
 	return nil
 }
 
-func extractReviewersFromMap(data map[string]interface{}, reviewers *[]BitbucketDefaultReviewer) {
-	for key, value := range data {
-		if key == "reviewers" {
-			if reviewersArray, ok := value.([]interface{}); ok {
-				for _, reviewer := range reviewersArray {
-					if reviewerMap, ok := reviewer.(map[string]interface{}); ok {
-						r := BitbucketDefaultReviewer{}
-						if user, ok := reviewerMap["user"].(map[string]interface{}); ok {
-							if name, ok := user["name"].(string); ok {
-								r.User.Name = name
-							}
-							if email, ok := user["emailAddress"].(string); ok {
-								r.User.EmailAddress = email
-							}
-							if displayName, ok := user["displayName"].(string); ok {
-								r.User.DisplayName = displayName
-							}
-						}
-						*reviewers = append(*reviewers, r)
-					}
-				}
-			}
-		} else if nestedMap, ok := value.(map[string]interface{}); ok {
-			extractReviewersFromMap(nestedMap, reviewers)
-		}
-	}
-}
-
 // BitbucketRepo holds information parsed from a BitBucket Server clone URL
 type BitbucketRepo struct {
-	BaseURL     string // e.g., https://bitbucket.example.com
+	BaseURL       string // e.g., https://bitbucket.example.com
 	ProjectOrUser string // e.g., PROJECT or ~username
-	RepoName    string // The repository name
+	RepoName      string // The repository name
 }
 
 // parseBitbucketCloneURL parses a BitBucket Server clone URL into its components
@@ -801,10 +766,10 @@ func parseBitbucketCloneURL(cloneURL string) (*BitbucketRepo, error) {
 
 	// Remove .git suffix if present
 	path := strings.TrimSuffix(u.Path, ".git")
-	
+
 	// Split path components
 	parts := strings.Split(strings.TrimPrefix(path, "/"), "/")
-	
+
 	// BitBucket Server clone URLs should have format:
 	// /scm/PROJECT/repo.git or /scm/~username/repo.git
 	if len(parts) < 3 || parts[0] != "scm" {
@@ -819,8 +784,8 @@ func parseBitbucketCloneURL(cloneURL string) (*BitbucketRepo, error) {
 	baseURL := fmt.Sprintf("%s://%s", u.Scheme, u.Host)
 
 	return &BitbucketRepo{
-		BaseURL:      baseURL,
+		BaseURL:       baseURL,
 		ProjectOrUser: projectOrUser, // Keep the project key or username as-is from the clone URL
-		RepoName:     repoName,
+		RepoName:      repoName,
 	}, nil
 }
