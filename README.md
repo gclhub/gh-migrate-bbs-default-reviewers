@@ -4,7 +4,7 @@ A GitHub CLI extension to migrate BitBucket Server default reviewers to GitHub C
 
 ## Version
 
-Current version: 1.0.0
+Current version: 1.0.1
 
 ## Installation
 
